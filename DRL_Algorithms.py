@@ -246,16 +246,17 @@ exploration.
 
 
 def policy(state, noise_object):
-    sampled_actions = tf.squeeze(actor_model(state))
-    noise = noise_object()
-    # Adding noise to action
-    sampled_actions = sampled_actions.numpy() + noise
+    with tf.device('GPU:0'):
+        sampled_actions = tf.squeeze(actor_model(state))
+        noise = noise_object()
+        # Adding noise to action
+        sampled_actions = sampled_actions.numpy() + noise
 
-    # We make sure action is within bounds
-    legal_action = np.clip(sampled_actions, lower_bound, upper_bound)
+        # We make sure action is within bounds
+        legal_action = np.clip(sampled_actions, lower_bound, upper_bound)
 
-    
-    return [np.squeeze(legal_action)]
+        output_array = [np.squeeze(legal_action)]
+    return output_array
 
 
 """
@@ -307,38 +308,34 @@ for ep in range(total_episodes):
     prev_state = env.reset()
     episodic_reward = 0
 
-    iteration = 0
+    print("Episode: "+ str(ep))
     while True:
-        # Uncomment this to see the Actor in action
-        # But not in a python notebook.
-        # env.render()
+        with tf.device('GPU:0'):
+            # Uncomment this to see the Actor in action
+            # But not in a python notebook.
+            # env.render()
+            
+            tf_prev_state = tf.expand_dims(tf.convert_to_tensor(prev_state[0], dtype=tf.float32), 0)
 
-        
-        
-        
-        tf_prev_state = tf.expand_dims(tf.convert_to_tensor(prev_state[0], dtype=tf.float32), 0)
+            
+            action = policy(tf_prev_state, ou_noise)
+            
+            # Recieve state and reward from environment.
+            state, reward, terminated, truncated, info = env.step(action)
+            state = tf.expand_dims(state, 0)
+            
+            buffer.record((prev_state[0], action, reward, state))
+            episodic_reward += reward
 
-        
-        action = policy(tf_prev_state, ou_noise)
-        
-        # Recieve state and reward from environment.
-        
-        state, reward, done, truncated, info = env.step(action)
-        state = tf.expand_dims(state, 0)
-        
-        buffer.record((prev_state[0], action, reward, state))
-        episodic_reward += reward
+            buffer.learn()
+            update_target(target_actor.variables, actor_model.variables, tau)
+            update_target(target_critic.variables, critic_model.variables, tau)
 
-        buffer.learn()
-        update_target(target_actor.variables, actor_model.variables, tau)
-        update_target(target_critic.variables, critic_model.variables, tau)
-
-        # End this episode when `done` is True
-        if done:
-            break
-
-        
-        prev_state = state
+            # End this episode when `truncated` or `terminated` are True
+            if terminated or truncated:
+                break
+            
+            prev_state = state
 
     ep_reward_list.append(episodic_reward)
 
