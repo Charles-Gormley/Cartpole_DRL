@@ -301,6 +301,7 @@ class ActorCritic:
         plt.ylabel("Avg. Epsiodic Reward")
         
         plt.savefig('results.png')
+        plt.clf()
 
     def write_hyperparameters_to_file(self):
         hyperparameters = {
