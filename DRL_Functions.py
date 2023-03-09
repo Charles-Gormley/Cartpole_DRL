@@ -1,4 +1,16 @@
+import gym
+import tensorflow as tf
+from tensorflow.keras import layers
+import numpy as np
+import matplotlib.pyplot as plt
 from os import chdir, makedirs
+from shutil import rmtree
+
+
+@tf.function
+def update_target(target_weights, weights, tau):
+    for (a, b) in zip(target_weights, weights):
+        a.assign(b * tau + a * (1 - tau))
 
 class OUActionNoise:
     def __init__(self, mean, std_deviation, theta=0.15, dt=1e-2, x_initial=None):
@@ -46,7 +58,7 @@ the maximum predicted value as seen by the Critic, for a given state.
 
 
 class Buffer:
-    def __init__(self, buffer_capacity=100000, batch_size=64):
+    def __init__(self, num_states:int, num_actions:int, target_actor, gamma, target_critic, critic_model, critic_optimizer, actor_optimizer, actor_model, buffer_capacity=100000, batch_size=64):
         # Number of "experiences" to store at max
         self.buffer_capacity = buffer_capacity
         # Num of tuples to train on.
@@ -61,6 +73,13 @@ class Buffer:
         self.action_buffer = np.zeros((self.buffer_capacity, num_actions))
         self.reward_buffer = np.zeros((self.buffer_capacity, 1))
         self.next_state_buffer = np.zeros((self.buffer_capacity, num_states))
+        self.target_actor = target_actor
+        self.gamma = gamma
+        self.target_critic = target_critic
+        self.critic_model = critic_model
+        self.critic_optimizer = critic_optimizer
+        self.actor_optimizer = actor_optimizer
+        self.actor_model = actor_model
 
     # Takes (s,a,r,s') obervation tuple as input
     def record(self, obs_tuple):
@@ -89,28 +108,28 @@ class Buffer:
         # Training and updating Actor & Critic networks.
         # See Pseudo Code.
         with tf.GradientTape() as tape:
-            target_actions = target_actor(next_state_batch, training=True)
-            y = reward_batch + gamma * target_critic(
+            target_actions = self.target_actor(next_state_batch, training=True)
+            y = reward_batch + self.gamma * self.target_critic(
                 [next_state_batch, target_actions], training=True
             )
-            critic_value = critic_model([state_batch, action_batch], training=True)
+            critic_value = self.critic_model([state_batch, action_batch], training=True)
             critic_loss = tf.math.reduce_mean(tf.math.square(y - critic_value))
 
-        critic_grad = tape.gradient(critic_loss, critic_model.trainable_variables)
-        critic_optimizer.apply_gradients(
-            zip(critic_grad, critic_model.trainable_variables)
+        critic_grad = tape.gradient(critic_loss, self.critic_model.trainable_variables)
+        self.critic_optimizer.apply_gradients(
+            zip(critic_grad, self.critic_model.trainable_variables)
         )
 
         with tf.GradientTape() as tape:
-            actions = actor_model(state_batch, training=True)
-            critic_value = critic_model([state_batch, actions], training=True)
+            actions = self.actor_model(state_batch, training=True)
+            critic_value = self.critic_model([state_batch, actions], training=True)
             # Used `-value` as we want to maximize the value given
             # by the critic for our actions
             actor_loss = -tf.math.reduce_mean(critic_value)
 
-        actor_grad = tape.gradient(actor_loss, actor_model.trainable_variables)
-        actor_optimizer.apply_gradients(
-            zip(actor_grad, actor_model.trainable_variables)
+        actor_grad = tape.gradient(actor_loss, self.actor_model.trainable_variables)
+        self.actor_optimizer.apply_gradients(
+            zip(actor_grad, self.actor_model.trainable_variables)
         )
 
     # We compute the loss and update parameters
@@ -132,169 +151,180 @@ class Buffer:
 
 # This update target parameters slowly
 # Based on rate `tau`, which is much less than one.
-@tf.function
-def update_target(target_weights, weights, tau):
-    for (a, b) in zip(target_weights, weights):
-        a.assign(b * tau + a * (1 - tau))
 
 
-"""
-Here we define the Actor and Critic networks. These are basic Dense models
-with `ReLU` activation.
-Note: We need the initialization for last layer of the Actor to be between
-`-0.003` and `0.003` as this prevents us from getting `1` or `-1` output values in
-the initial stages, which would squash our gradients to zero,
-as we use the `tanh` activation.
-"""
+class ActorCritic:
+    def __init__(self, problem:str, std_dev:float, actor_lr, critic_lr, gamma, tau, total_episodes):
+        self.problem = problem
+        self.std_dev = std_dev
+        self.actor_lr = actor_lr
+        self.critic_lr = critic_lr
+        self.gamma = gamma
+        self.tau = tau
+        self.total_episodes = total_episodes
 
+        self.create_env()
 
-def get_actor():
-    # Initialize weights between -3e-3 and 3-e3
-    last_init = tf.random_uniform_initializer(minval=-0.003, maxval=0.003)
+        self.ou_noise = OUActionNoise(mean=np.zeros(1), std_deviation=float(std_dev) * np.ones(1))
 
-    inputs = layers.Input(shape=(num_states,))
-    out = layers.Dense(256, activation="relu")(inputs)
-    out = layers.Dense(256, activation="relu")(out)
-    outputs = layers.Dense(1, activation="tanh", kernel_initializer=last_init)(out)
+        self.actor_model = self.get_actor()
+        self.critic_model = self.get_critic()
 
-    # Our upper bound is 2.0 for Pendulum.
-    outputs = outputs * upper_bound
-    model = tf.keras.Model(inputs, outputs)
-    return model
+        self.target_actor = self.get_actor()
+        self.target_critic = self.get_critic()
 
+        self.target_actor.set_weights(self.actor_model.get_weights())
+        self.target_critic.set_weights(self.critic_model.get_weights())
 
-def get_critic():
-    # State as input
-    state_input = layers.Input(shape=(num_states))
-    state_out = layers.Dense(16, activation="relu")(state_input)
-    state_out = layers.Dense(32, activation="relu")(state_out)
+        self.critic_optimizer = tf.keras.optimizers.Adam(critic_lr)
+        self.actor_optimizer = tf.keras.optimizers.Adam(actor_lr)
 
-    # Action as input
-    action_input = layers.Input(shape=(num_actions))
-    action_out = layers.Dense(32, activation="relu")(action_input)
+        self.buffer = Buffer(self.num_states, self.num_actions, self.target_actor, self.gamma, self.target_critic, self.critic_model, self.critic_optimizer, self.actor_optimizer, self.actor_model, 50000, 64, )
 
-    # Both are passed through seperate layer before concatenating
-    concat = layers.Concatenate()([state_out, action_out])
-
-    out = layers.Dense(256, activation="relu")(concat)
-    out = layers.Dense(256, activation="relu")(out)
-    outputs = layers.Dense(1)(out)
-
-    # Outputs single value for give state-action
-    model = tf.keras.Model([state_input, action_input], outputs)
-
-    return model
-
-class Training(env, std_dev, actor_lr, critic_lr, gamma, tau, total_episodes):
-    def __init__():
-
-
-def policy(state, noise_object):
-    with tf.device('GPU:0'):
-        sampled_actions = tf.squeeze(actor_model(state))
-        noise = noise_object()
-        # Adding noise to action
-        sampled_actions = sampled_actions.numpy() + noise
-
-        # We make sure action is within bounds
-        legal_action = np.clip(sampled_actions, lower_bound, upper_bound)
-
-        output_array = [np.squeeze(legal_action)]
-    return output_array
-
-
-
-
-def train_actor_critic(env, std_dev, actor_lr, critic_lr, gamma, tau, total_episodes):
-    ou_noise = OUActionNoise(mean=np.zeros(1), std_deviation=float(std_dev) * np.ones(1))
-
-    actor_model = get_actor()
-    critic_model = get_critic()
-
-    target_actor = get_actor()
-    target_critic = get_critic()
-
-    target_actor.set_weights(actor_model.get_weights())
-    target_critic.set_weights(critic_model.get_weights())
-
-    critic_optimizer = tf.keras.optimizers.Adam(critic_lr)
-    actor_optimizer = tf.keras.optimizers.Adam(actor_lr)
-
-    buffer = Buffer(50000, 64)
-
-    ep_reward_list = []
-    avg_reward_list = []
-
-    for ep in range(total_episodes):
-        prev_state = env.reset()
-        episodic_reward = 0
-
-        print("Episode: "+ str(ep))
-        while True:
-            with tf.device('GPU:0'):
-                tf_prev_state = tf.expand_dims(tf.convert_to_tensor(prev_state[0], dtype=tf.float32), 0)
-
-                action = policy(tf_prev_state, ou_noise)
-
-                state, reward, terminated, truncated, info = env.step(action)
-                state = tf.expand_dims(state, 0)
-
-                buffer.record((prev_state[0], action, reward, state))
-                episodic_reward += reward
-
-                buffer.learn()
-                update_target(target_actor.variables, actor_model.variables, tau)
-                update_target(target_critic.variables, critic_model.variables, tau)
-
-                if terminated or truncated:
-                    break
-
-                prev_state = state
-
-        ep_reward_list.append(episodic_reward)
-
-        avg_reward = np.mean(ep_reward_list[-40:])
-        print("Episode * {} * Avg Reward is ==> {}".format(ep, avg_reward))
-        avg_reward_list.append(avg_reward)
-
-    return ep_reward_list, avg_reward_list
-
-def create_state(problem : str):
-    env = gym.make(problem)
-
-    num_states = env.observation_space.shape[0]
-    print("Size of State Space ->  {}".format(num_states))
-    num_actions = env.action_space.shape[0]
-    print("Size of Action Space ->  {}".format(num_actions))
-
-    upper_bound = env.action_space.high[0]
-    lower_bound = env.action_space.low[0]
-
-    print("Max Value of Action ->  {}".format(upper_bound))
-    print("Min Value of Action ->  {}".format(lower_bound))
-        
-def display_episode(avg_reward_list : list):
-    sub_folder = 'Weights-' + str(iteration)
-
-    chdir('Model-Results')
-    makedirs(sub_folder)
-
-    plt.plot(avg_reward_list)
-    plt.xlabel("Episode")
-    plt.ylabel("Avg. Epsiodic Reward")
+        self.ep_reward_list = []
+        self.avg_reward_list = []
     
-    plt.savefig('{}/results.png'.format(sub_folder))
+    def create_env(self):
+        self.env = gym.make(self.problem)
 
-def save_weights(iteration : int):
-    sub_folder = 'Weights-' + str(iteration)
+        self.num_states = self.env.observation_space.shape[0]
+        print("Size of State Space ->  {}".format(self.num_states))
+        self.num_actions = self.env.action_space.shape[0]
+        print("Size of Action Space ->  {}".format(self.num_actions))
 
-    # Save the weights
-    actor_model.save_weights("{}/pendulum_actor.h5".format(sub_folder))
-    critic_model.save_weights("{}/pendulum_critic.h5".format(sub_folder))
+        self.upper_bound = self.env.action_space.high[0]
+        self.lower_bound = self.env.action_space.low[0]
 
-    target_actor.save_weights("{}/pendulum_target_actor.h5".format(sub_folder))
-    target_critic.save_weights("{}/pendulum_target_critic.h5".format(sub_folder))
+        print("Max Value of Action ->  {}".format(self.upper_bound))
+        print("Min Value of Action ->  {}".format(self.lower_bound))
 
-    os.chdir('..')
 
+
+    def get_actor(self):
+        # Initialize weights between -3e-3 and 3-e3
+        last_init = tf.random_uniform_initializer(minval=-0.003, maxval=0.003)
+
+        inputs = layers.Input(shape=(self.num_states,))
+        out = layers.Dense(256, activation="relu")(inputs)
+        out = layers.Dense(256, activation="relu")(out)
+        outputs = layers.Dense(1, activation="tanh", kernel_initializer=last_init)(out)
+
+        # Our upper bound is 2.0 for Pendulum.
+        outputs = outputs * self.upper_bound
+        model = tf.keras.Model(inputs, outputs)
+        return model
+
+
+    def get_critic(self):
+        # State as input
+        state_input = layers.Input(shape=(self.num_states))
+        state_out = layers.Dense(16, activation="relu")(state_input)
+        state_out = layers.Dense(32, activation="relu")(state_out)
+
+        # Action as input
+        action_input = layers.Input(shape=(self.num_actions))
+        action_out = layers.Dense(32, activation="relu")(action_input)
+
+        # Both are passed through seperate layer before concatenating
+        concat = layers.Concatenate()([state_out, action_out])
+
+        out = layers.Dense(256, activation="relu")(concat)
+        out = layers.Dense(256, activation="relu")(out)
+        outputs = layers.Dense(1)(out)
+
+        # Outputs single value for give state-action
+        model = tf.keras.Model([state_input, action_input], outputs)
+
+        return model
+
+    def policy(self, state, noise_object):
+        with tf.device('GPU:0'):
+            sampled_actions = tf.squeeze(self.actor_model(state))
+            noise = noise_object()
+            # Adding noise to action
+            sampled_actions = sampled_actions.numpy() + noise
+
+            # We make sure action is within bounds
+            legal_action = np.clip(sampled_actions, self.lower_bound, self.upper_bound)
+
+            output_array = [np.squeeze(legal_action)]
+        return output_array
+
+    def train_actor_critic(self):
+        for ep in range(self.total_episodes):
+            prev_state = self.env.reset()
+            episodic_reward = 0
+
+            print("Episode: "+ str(ep))
+            while True:
+                with tf.device('GPU:0'):
+                    tf_prev_state = tf.expand_dims(tf.convert_to_tensor(prev_state[0], dtype=tf.float32), 0)
+
+                    action = self.policy(tf_prev_state, self.ou_noise)
+
+                    state, reward, terminated, truncated, info = self.env.step(action)
+                    state = tf.expand_dims(state, 0)
+
+                    self.buffer.record((prev_state[0], action, reward, state))
+                    episodic_reward += reward
+
+                    self.buffer.learn()
+                    update_target(self.target_actor.variables, self.actor_model.variables, self.tau)
+                    update_target(self.target_critic.variables, self.critic_model.variables, self.tau)
+
+                    if terminated or truncated:
+                        break
+
+                    prev_state = state
+
+            self.ep_reward_list.append(episodic_reward)
+
+            avg_reward = np.mean(self.ep_reward_list[-40:])
+            print("Episode * {} * Avg Reward is ==> {}".format(ep, avg_reward))
+            self.avg_reward_list.append(avg_reward)
+
+        return self.ep_reward_list, self.avg_reward_list
+    def display_episode(self, iteration:int):
+        self.sub_folder = 'Weights-' + str(iteration)
+
+        chdir('Model-Results')
+        try:
+            rmtree(self.sub_folder)
+        except:
+            pass
+
+        makedirs(self.sub_folder)
+        chdir(self.sub_folder)
+
+        plt.plot(self.avg_reward_list)
+        plt.xlabel("Episode")
+        plt.ylabel("Avg. Epsiodic Reward")
+        
+        plt.savefig('results.png')
+
+    def write_hyperparameters_to_file(self):
+        hyperparameters = {
+        'env': self.env,
+        'std_dev': self.std_dev,
+        'actor_lr': self.actor_lr,
+        'critic_lr': self.critic_lr,
+        'gamma': self.gamma,
+        'tau': self.tau,
+        'total_episodes': self.total_episodes
+        }
+        with open('hyperparameters.txt', 'w') as file:
+            for name, value in hyperparameters.items():
+                file.write(f"{name}: {value}\n")
+
+    def save_weights(self):
+
+        # Save the weights
+        self.actor_model.save_weights("pendulum_actor.h5")
+        self.critic_model.save_weights("pendulum_critic.h5")
+
+        self.target_actor.save_weights("pendulum_target_actor.h5")
+        self.target_critic.save_weights("pendulum_target_critic.h5")
+
+        chdir('..')
+        chdir('..')
     
