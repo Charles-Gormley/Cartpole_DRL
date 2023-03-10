@@ -23,34 +23,44 @@ print("Min Value of Action ->  {}".format(lower_bound))
 
 trial_params = []
 
-tau = .4
-        
-for i in range(2):
-    hyperparameters = {
-        'env': "Pendulum-v1",
-        'std_dev': 0.2,
-        'actor_lr': 0.001,
-        'critic_lr': 0.002,
-        'gamma': .99,
-        'tau': tau,
-        'total_episodes': 100
-    }
-    trial_params.append(hyperparameters)
+tau_values = [.0001, .001,  .01, .1]
+std_dev_values = [.02, .2, .4]
+actor_critic_values = [[.0001, .0002], [.001, .002],  [.01, .02], [.1, .2]]
 
-    model = ActorCritic(hyperparameters['env'], 
-                hyperparameters['std_dev'], 
-                hyperparameters['actor_lr'],
-                hyperparameters['critic_lr'],
-                hyperparameters['gamma'],
-                hyperparameters['tau'],
-                hyperparameters['total_episodes']
-                )
-    model.train_actor_critic()
-    model.display_episode(i)
-    model.write_hyperparameters_to_file()
-    model.save_weights()
+i = 0 
+for tau in tau_values:
+    for std_dev in std_dev_values:
+        for actor_critic_value in actor_critic_values:
+            actor_lr = actor_critic_value[0]
+            critic_lr = actor_critic_value[1]
 
-    tau -= .04
+
+
+
+            hyperparameters = {
+                'env': "Pendulum-v1",
+                'std_dev': std_dev,
+                'actor_lr': actor_lr,
+                'critic_lr': critic_lr,
+                'gamma': .99,
+                'tau': tau,
+                'total_episodes': 1000
+            }
+            trial_params.append(hyperparameters)
+
+            model = ActorCritic(hyperparameters['env'], 
+                        hyperparameters['std_dev'], 
+                        hyperparameters['actor_lr'],
+                        hyperparameters['critic_lr'],
+                        hyperparameters['gamma'],
+                        hyperparameters['tau'],
+                        hyperparameters['total_episodes']
+                        )
+            model.train_actor_critic()
+            model.display_episode(i)
+            model.write_hyperparameters_to_file()
+            model.save_weights()
+            i += 1
 
         
 print(trial_params)
